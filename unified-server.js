@@ -1198,23 +1198,10 @@ class RequestHandler {
   }
   _buildProxyRequest(req, requestId) {
     let requestBody = "";
-    // [新增] 增加调试功能，用于主动触发错误
-    let debugErrorCode = null;
-
     if (req.body) {
-      // 检查请求体中是否包含调试参数
-      if (req.body.debug_trigger_error) {
-        debugErrorCode = parseInt(req.body.debug_trigger_error, 10);
-        this.logger.warn(
-          `[Debug] 检测到错误触发指令，将模拟 HTTP ${debugErrorCode} 错误。`
-        );
-        // 从请求体中删除这个参数，避免发送给Google API
-        delete req.body.debug_trigger_error;
-      }
       requestBody = JSON.stringify(req.body);
     }
-
-    const proxyRequest = {
+    return {
       path: req.path,
       method: req.method,
       headers: req.headers,
@@ -1223,13 +1210,6 @@ class RequestHandler {
       request_id: requestId,
       streaming_mode: this.serverSystem.streamingMode,
     };
-
-    // 如果检测到了调试参数，就把它附加到发往浏览器的请求中
-    if (debugErrorCode) {
-      proxyRequest.debug_trigger_error_code = debugErrorCode;
-    }
-
-    return proxyRequest;
   }
   _forwardRequest(proxyRequest) {
     const connection = this.connectionRegistry.getFirstConnection();
