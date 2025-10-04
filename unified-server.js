@@ -977,12 +977,14 @@ class RequestHandler {
     }
   }
 
+  // unified-server.js 文件内，RequestHandler 类中的 processOpenAIRequest 函数
+
   async processOpenAIRequest(req, res) {
     const requestId = this._generateRequestId();
     const isOpenAIStream = req.body.stream === true;
-    const model = req.body.model || "gemini-1.5-pro-latest"; // 从请求中获取模型或使用默认
+    const model = req.body.model || "gemini-1.5-pro-latest";
 
-    // 1. 翻译请求体
+    // 1. 翻译请求体 (逻辑保持不变)
     let googleBody;
     try {
       googleBody = this._translateOpenAIToGoogle(req.body, model);
@@ -995,8 +997,7 @@ class RequestHandler {
       );
     }
 
-    // 2. 构建代理请求
-    // 决定请求Google的哪个接口（流式或非流式）
+    // 2. 构建代理请求 (逻辑保持不变)
     const googleEndpoint = isOpenAIStream
       ? "streamGenerateContent"
       : "generateContent";
@@ -1007,25 +1008,67 @@ class RequestHandler {
       query_params: isOpenAIStream ? { alt: "sse" } : {},
       body: JSON.stringify(googleBody),
       request_id: requestId,
-      streaming_mode: "real", // 对于适配器，我们总是让浏览器端进行真实请求
-      client_wants_stream: true, // 告诉浏览器脚本总是显示模式
+      // [关键修改] 明确标记这是一个生成式请求，以便切换逻辑可以正确重置失败计数
+      is_generative: true,
+      streaming_mode: "real",
+      client_wants_stream: true,
     };
 
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
 
-    // 3. 发送和接收（复用现有逻辑）
     try {
+      // [新增-步骤1] 统一发送请求并等待初始响应
+      this._forwardRequest(proxyRequest);
+      const initialMessage = await messageQueue.dequeue(); // 等待第一个消息，可能是headers或error
+
+      // [新增-步骤2] 检查初始响应是否为错误
+      if (initialMessage.event_type === "error") {
+        // 如果是错误，则触发失败处理和账户切换逻辑
+        this.logger.error(
+          `[Adapter] 收到来自浏览器的错误，将触发切换逻辑。状态码: ${initialMessage.status}, 消息: ${initialMessage.message}`
+        );
+
+        // 调用现有的切换逻辑
+        await this._handleRequestFailureAndSwitch(initialMessage, res);
+
+        // 根据请求是流式还是非流式，以合适的方式结束响应
+        if (isOpenAIStream) {
+          // 对于流式请求，在发送完错误块后（由_handleRequestFailureAndSwitch内部完成），
+          // 发送一个 [DONE] 信号并结束响应，是符合OpenAI规范的健壮做法。
+          if (!res.writableEnded) {
+            res.write("data: [DONE]\n\n");
+            res.end();
+          }
+        } else {
+          // 对于非流式请求，直接发送一个标准的JSON错误响应
+          this._sendErrorResponse(
+            res,
+            initialMessage.status || 500,
+            initialMessage.message
+          );
+        }
+        return; // 处理完毕，提前退出函数
+      }
+
+      // [新增-步骤3] 如果初始响应不是错误，则说明请求成功，重置失败计数
+      if (this.failureCount > 0) {
+        this.logger.info(
+          `✅ [Auth] OpenAI接口请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+        );
+        this.failureCount = 0;
+      }
+
+      // [逻辑微调] 将原有代码放入 else 块中，并根据流式/非流式分别处理
       if (isOpenAIStream) {
-        // 设置流式响应头
+        // --- 处理流式响应 ---
         res.status(200).set({
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
         });
 
-        this._forwardRequest(proxyRequest);
+        // initialMessage 是 headers，在OpenAI适配器中我们不需要它，所以直接开始循环处理后续的 chunk
         let lastGoogleChunk = "";
-        // 循环接收并翻译响应
         while (true) {
           const message = await messageQueue.dequeue(300000); // 5分钟超时
           if (message.type === "STREAM_END") {
@@ -1040,9 +1083,11 @@ class RequestHandler {
             if (translatedChunk) {
               res.write(translatedChunk);
             }
+            lastGoogleChunk = message.data; // [修正] 总是记录最后一个数据块
           }
         }
 
+        // 记录结束原因
         try {
           if (lastGoogleChunk.startsWith("data: ")) {
             const jsonString = lastGoogleChunk.substring(6).trim();
@@ -1051,29 +1096,38 @@ class RequestHandler {
               const finishReason =
                 lastResponse.candidates?.[0]?.finishReason || "UNKNOWN";
               this.logger.info(
-                `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${requestId}`
+                `✅ [Request] OpenAI流式响应结束，原因: ${finishReason}，请求ID: ${requestId}`
               );
             }
           }
         } catch (e) {
-          // 解析失败则不记录，以防万一
+          // 解析失败则不记录
         }
       } else {
-        // 非流式逻辑
-        this._forwardRequest(proxyRequest);
-        await messageQueue.dequeue(); // Header
-        const bodyMsg = await messageQueue.dequeue();
-        const googleResponse = JSON.parse(bodyMsg.data);
+        // --- 处理非流式响应 ---
+        // initialMessage 是 headers，同样不需要。现在等待body。
+        // [修正] 非流式响应也可能被分块，需要循环接收直到结束
+        let fullBody = "";
+        while (true) {
+          const message = await messageQueue.dequeue(300000);
+          if (message.type === "STREAM_END") {
+            break;
+          }
+          if (message.event_type === "chunk" && message.data) {
+            fullBody += message.data;
+          }
+        }
 
-        let responseContent = "";
+        const googleResponse = JSON.parse(fullBody);
         const candidate = googleResponse.candidates?.[0];
 
+        // 后续的翻译逻辑保持不变...
+        let responseContent = "";
         if (
           candidate &&
           candidate.content &&
           Array.isArray(candidate.content.parts)
         ) {
-          // 优先在 parts 中寻找图片数据
           const imagePart = candidate.content.parts.find((p) => p.inlineData);
           if (imagePart) {
             const image = imagePart.inlineData;
@@ -1082,7 +1136,6 @@ class RequestHandler {
               "[Adapter] 从 parts.inlineData 中成功解析到图片。"
             );
           } else {
-            // 如果没有图片，则拼接所有文本部分
             responseContent =
               candidate.content.parts.map((p) => p.text).join("\n") || "";
           }
@@ -1097,19 +1150,20 @@ class RequestHandler {
             {
               index: 0,
               message: { role: "assistant", content: responseContent },
-              finish_reason: candidate?.finishReason,
+              finish_reason: candidate?.finishReason || "UNKNOWN",
             },
           ],
         };
 
         const finishReason = candidate?.finishReason || "UNKNOWN";
         this.logger.info(
-          `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${requestId}`
+          `✅ [Request] OpenAI非流式响应结束，原因: ${finishReason}，请求ID: ${requestId}`
         );
 
         res.status(200).json(openaiResponse);
       }
     } catch (error) {
+      // 这个 catch 块主要处理超时等意外情况
       this._handleRequestError(error, res);
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
@@ -1144,10 +1198,23 @@ class RequestHandler {
   }
   _buildProxyRequest(req, requestId) {
     let requestBody = "";
+    // [新增] 增加调试功能，用于主动触发错误
+    let debugErrorCode = null;
+
     if (req.body) {
+      // 检查请求体中是否包含调试参数
+      if (req.body.debug_trigger_error) {
+        debugErrorCode = parseInt(req.body.debug_trigger_error, 10);
+        this.logger.warn(
+          `[Debug] 检测到错误触发指令，将模拟 HTTP ${debugErrorCode} 错误。`
+        );
+        // 从请求体中删除这个参数，避免发送给Google API
+        delete req.body.debug_trigger_error;
+      }
       requestBody = JSON.stringify(req.body);
     }
-    return {
+
+    const proxyRequest = {
       path: req.path,
       method: req.method,
       headers: req.headers,
@@ -1156,6 +1223,13 @@ class RequestHandler {
       request_id: requestId,
       streaming_mode: this.serverSystem.streamingMode,
     };
+
+    // 如果检测到了调试参数，就把它附加到发往浏览器的请求中
+    if (debugErrorCode) {
+      proxyRequest.debug_trigger_error_code = debugErrorCode;
+    }
+
+    return proxyRequest;
   }
   _forwardRequest(proxyRequest) {
     const connection = this.connectionRegistry.getFirstConnection();
