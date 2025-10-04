@@ -93,28 +93,6 @@ class RequestProcessor {
   }
 
   execute(requestSpec, operationId) {
-    // [新增] 调试功能：检查是否存在错误触发指令
-    if (requestSpec.debug_trigger_error_code) {
-      const errorCode = requestSpec.debug_trigger_error_code;
-      Logger.output(
-        `[Debug] 收到错误模拟指令，将立即返回 HTTP ${errorCode} 错误。`
-      );
-
-      // 创建一个模拟的错误对象，使其结构与真实的 fetch 错误相似
-      const simulatedError = new Error(
-        `Google API返回错误: ${errorCode} Simulated Error (for testing)`
-      );
-      simulatedError.status = errorCode; // 附加状态码，服务器端会读取这个值
-
-      // 直接返回一个立即被拒绝的 Promise，跳过所有网络请求
-      return {
-        responsePromise: Promise.reject(simulatedError),
-        // 提供一个空的 cancelTimeout 函数，因为没有实际的超时
-        cancelTimeout: () => {},
-      };
-    }
-
-    // --- 以下为原始的 execute 函数逻辑，保持不变 ---
     const IDLE_TIMEOUT_DURATION = 600000;
     const abortController = new AbortController();
     this.activeOperations.set(operationId, abortController);
@@ -250,31 +228,6 @@ class RequestProcessor {
     ) {
       try {
         let bodyObj = JSON.parse(requestSpec.body);
-
-        // [新增] 增加从前端文本中提取调试指令的功能
-        const debugRegex = /debug_trigger_error:\s*(\d{3})/;
-        if (bodyObj.contents && bodyObj.contents.length > 0) {
-          const currentTurn = bodyObj.contents[bodyObj.contents.length - 1];
-          if (currentTurn.parts?.length > 0) {
-            let lastTextPart = currentTurn.parts.findLast((p) => p.text);
-            if (lastTextPart && lastTextPart.text) {
-              const match = lastTextPart.text.match(debugRegex);
-              if (match && match[1]) {
-                const errorCode = parseInt(match[1], 10);
-                Logger.output(
-                  `[Debug] 从前端文本中检测到错误触发指令: ${errorCode}`
-                );
-                // 将错误码附加到 requestSpec 上，以便 execute 函数可以捕获它
-                requestSpec.debug_trigger_error_code = errorCode;
-                // 从文本中移除指令，避免发送给模型
-                lastTextPart.text = lastTextPart.text
-                  .replace(debugRegex, "")
-                  .trim();
-              }
-            }
-          }
-        }
-        // [新增功能结束]
 
         // --- 模块1：智能过滤 (保留) ---
         const isImageModel =
