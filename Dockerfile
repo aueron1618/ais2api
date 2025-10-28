@@ -15,18 +15,44 @@ RUN apt-get update && apt-get install -y \
 COPY package*.json ./
 RUN npm install --production
 
-# 3. 【修复】浏览器下载和解压 - 添加错误处理和调试信息
+# 3. 【修复】浏览器下载和解压 - 双重下载策略（官方源 + 备用源）
 ARG CAMOUFOX_URL
-RUN echo "Downloading browser from: ${CAMOUFOX_URL}" && \
-    curl -fSL "${CAMOUFOX_URL}" -o camoufox-linux.tar.gz && \
-    echo "Download completed, extracting..." && \
+ARG FALLBACK_URL
+RUN echo "=== Browser Download Strategy ===" && \
+    echo "Primary URL: ${CAMOUFOX_URL}" && \
+    echo "Fallback URL: ${FALLBACK_URL}" && \
+    echo "" && \
+    # 尝试从主 URL 下载
+    if [ -n "${CAMOUFOX_URL}" ]; then \
+        echo "Attempting download from primary source..." && \
+        if curl -fSL "${CAMOUFOX_URL}" -o camoufox-linux.tar.gz; then \
+            echo "✓ Primary download successful"; \
+        else \
+            echo "✗ Primary download failed, trying fallback..."; \
+            rm -f camoufox-linux.tar.gz; \
+        fi; \
+    else \
+        echo "⚠ Primary URL is empty, skipping to fallback..."; \
+    fi && \
+    # 如果主 URL 失败或为空，使用备用 URL
+    if [ ! -f camoufox-linux.tar.gz ]; then \
+        echo "Downloading from fallback source..." && \
+        curl -fSL "${FALLBACK_URL}" -o camoufox-linux.tar.gz && \
+        echo "✓ Fallback download successful"; \
+    fi && \
+    echo "" && \
+    echo "Extracting archive..." && \
     tar -xzf camoufox-linux.tar.gz && \
+    echo "✓ Extraction completed" && \
+    echo "" && \
+    echo "Directory contents:" && \
     ls -la && \
-    echo "Cleaning up..." && \
+    echo "" && \
+    echo "Cleaning up archive..." && \
     rm camoufox-linux.tar.gz && \
-    echo "Setting permissions..." && \
+    echo "Setting executable permissions..." && \
     chmod +x /app/camoufox-linux/camoufox && \
-    echo "Browser setup completed successfully"
+    echo "✓ Browser setup completed successfully"
 
 # 4. 拷贝代码文件
 COPY unified-server.js black-browser.js models.json ./

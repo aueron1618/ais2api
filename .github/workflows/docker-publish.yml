@@ -12,11 +12,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get Camoufox Download URL
+      - name: Get Camoufox Download URL (with fallback)
         id: get_camoufox_url
         run: |
-          URL=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest" | grep "browser_download_url.*camoufox-linux.tar.gz" | cut -d : -f 2,3 | tr -d '", ')
-          echo "CAMOUFOX_URL=$URL" >> $GITHUB_ENV
+          echo "=== Fetching Camoufox Download URLs ==="
+          
+          # 尝试从 Camoufox 官方仓库获取最新版本
+          echo "Attempting to get latest version from Camoufox official repository..."
+          OFFICIAL_URL=$(curl -s "https://api.github.com/repos/daijro/camoufox/releases/latest" | grep "browser_download_url.*linux.*tar.gz" | head -1 | cut -d : -f 2,3 | tr -d '", ')
+          
+          if [ -n "$OFFICIAL_URL" ]; then
+            echo "✓ Found official URL: $OFFICIAL_URL"
+            echo "CAMOUFOX_URL=$OFFICIAL_URL" >> $GITHUB_ENV
+          else
+            echo "⚠ Could not find official URL, will use fallback only"
+            echo "CAMOUFOX_URL=" >> $GITHUB_ENV
+          fi
+          
+          # 设置备用 URL（从您的仓库 release）
+          FALLBACK_URL="https://github.com/Ellinav/ais2api/releases/download/v1.0/camoufox-linux.tar.gz"
+          echo "Fallback URL: $FALLBACK_URL"
+          echo "FALLBACK_URL=$FALLBACK_URL" >> $GITHUB_ENV
+          
+          echo "=== URL Configuration Complete ==="
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -38,5 +56,6 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:latest
           build-args: |
             CAMOUFOX_URL=${{ env.CAMOUFOX_URL }}
+            FALLBACK_URL=${{ env.FALLBACK_URL }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
